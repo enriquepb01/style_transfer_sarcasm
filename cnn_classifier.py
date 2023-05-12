@@ -7,14 +7,14 @@ import preprocessing
 from tqdm import tqdm
 import pickle
 
-def dropout_block(n_in, n_hidden, drate):
+def fully_connected(n_in, n_hidden, drate):
     return nn.Sequential(
         nn.Linear(n_in, n_hidden),
         nn.ReLU(),
         nn.Dropout(p=drate)
     )
 
-class bert_embedding(nn.Module):
+class BertEmbedding(nn.Module):
     def __init__(self, trainable):
         super().__init__()
         self.bert = BertModel.from_pretrained('bert-base-uncased', output_hidden_states=True)
@@ -23,17 +23,15 @@ class bert_embedding(nn.Module):
 
     def forward(self, ids, mask):
         out = self.bert(ids, attention_mask=mask, return_dict=True)
-        hiddens = out.hidden_states
-        hiddens = torch.stack(hiddens, dim=0)
-        hiddens = hiddens[9:, :, :, :].mean(dim=0)
+        hiddens = out.hidden_states # retrieve hidden states
+        hiddens = torch.stack(hiddens, dim=0) # shape (13 layers, batch size, sequence length, 768)
+        hiddens = hiddens[9:, :, :, :].mean(dim=0) # average over last four layers; shape (batch size, sequence length, 768)
         return hiddens
 
-class bert_linear(nn.Module):
-    def __init__(self, train_bert):
+class BertCNN(nn.Module):
+    def __init__(self, train_bert, sentence_max_size):
         super().__init__()
-        self.sentence_max_size = 20
-
-        self.bert = bert_embedding(trainable=train_bert)
+        self.bert = BertEmbedding(trainable=train_bert)
 
         # Convolutional layers
         self.conv1 = nn.Conv2d(1, 1, (2, 768))
@@ -48,12 +46,13 @@ class bert_linear(nn.Module):
         self.maxpool4 = nn.MaxPool2d((self.sentence_max_size-5+1, 1))
 
         # Classifier network
-        self.out_preact = nn.Linear(4, 2)
-        self.out = nn.Sigmoid()
+        self.out = nn.Linear(4, 2)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, ids, mask):
         y = self.bert(ids, mask=mask)
-
+        y = torch.unsqueeze(y, 1)
+        
         y1 = F.relu(self.conv1(y))
         y2 = F.relu(self.conv2(y))
         y3 = F.relu(self.conv3(y))
@@ -65,9 +64,10 @@ class bert_linear(nn.Module):
         y4 = self.maxpool4(y4)
 
         y = torch.cat((y1, y2, y3, y4), -1)
-        y = self.out_preact(y)
         y = self.out(y)
-        return y
+        y = self.sigmoid(y)
+
+        return y.reshape((y.size(0),2))
 
 class token_loader:
     def __init__(self, data, target, max_length):
@@ -107,10 +107,10 @@ def BCE(output, label):
     return nn.BCELoss()(output, label)
 
 def train(model, dataloader, loss_fn, accum_steps, optimizer, device):
-    # model.to(device)
+    model.to(device)
     model.train()
     running_loss = 0; running_acc = 0
-    with tqdm(total=len(dataloader), desc=f"Train", unit="Batch") as pbar:
+    with tqdm(total=len(dataloader), desc=f"Train", unit="Batch") as prog:
         for bi, d in enumerate(dataloader):
             ids = d["ids"]
             mask = d["mask"]
@@ -120,31 +120,33 @@ def train(model, dataloader, loss_fn, accum_steps, optimizer, device):
             mask = mask.to(device, dtype=torch.long)
             targets = targets.to(device, dtype=torch.int64)
 
-            output = model(
+            output = model( # forward pass
                 ids=ids,
                 mask=mask
             )
         
-            loss = loss_fn(output, targets.unsqueeze(-1))
+            loss = loss_fn(output, targets)
             running_loss += loss.item()
             running_acc += (output.argmax(1) == targets).float().mean().item()
             loss = loss / accum_steps
-            loss.backward()
-            if((bi + 1) % accum_steps == 0) or (bi + 1 == len(dataloader)):
+            loss.backward() # backward pass
+
+            if((bi + 1) % accum_steps == 0) or (bi + 1 == len(dataloader)): # gradientt accumulation
                 optimizer.step()
                 optimizer.zero_grad()
-            pbar.set_postfix({'loss': loss.item(), 'acc': 100 * running_acc/(bi+1)})
-            pbar.update()
-            pbar.refresh()
+
+            prog.set_postfix({'loss': loss.item(), 'acc': 100 * running_acc/(bi+1)})
+            prog.update()
+            prog.refresh()
 
     return running_loss / len(dataloader), running_acc / len(dataloader)            
 
 def validate(model, dataloader, loss_fn, device, tag='Val'):
-    # model.to(device)
+    model.to(device)
     model.eval()
     running_loss = 0; running_acc = 0
     with torch.no_grad():
-        with tqdm(total=len(dataloader), desc=tag, unit="Batch") as pbar:
+        with tqdm(total=len(dataloader), desc=tag, unit="Batch") as prog:
             for bi, d in enumerate(dataloader):
                 ids = d['ids']
                 mask = d['mask']
@@ -162,8 +164,8 @@ def validate(model, dataloader, loss_fn, device, tag='Val'):
                 loss = loss_fn(output, targets)
                 running_loss += loss.item()
                 running_acc += (output.argmax(1) == targets).float().mean().item()
-                pbar.set_postfix({'loss': loss.item(), 'acc': 100. * running_acc / (bi+1)})
-                pbar.update()
+                prog.set_postfix({'loss': loss.item(), 'acc': 100. * running_acc / (bi+1)})
+                prog.update()
 
     return running_loss / len(dataloader), running_acc / len(dataloader)
 
@@ -196,7 +198,7 @@ def run(max_samples, max_length, n_epochs,
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    model = bert_linear(train_bert=train_bert)
+    model = BertCNN(train_bert=train_bert, sentence_max_size=max_length)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=reg_val)
 
     if torch.cuda.is_available() and not use_CPU:
@@ -236,17 +238,19 @@ def run(max_samples, max_length, n_epochs,
     print(f"\nBest & Final Accuracy: {best_acc}\nWe're done here.")
 
 if __name__ == "__main__":
+
     train_kwargs = {
         'train_bert': True,
         'use_CPU': False,
         'path': "run3",
-        'max_samples': 500000,
-        'lr': 3e-5/4,
+        'max_samples': 100000,
+        'lr': 3e-5,
         'reg_val': 1e-2,
         'batch_size': 16,
         'accum_steps': 1,
-        'halve_lr_at': 0,
+        'halve_lr_at': 2,
         'n_epochs': 4,
         'max_length': 21
         } 
+    
     run(**train_kwargs)

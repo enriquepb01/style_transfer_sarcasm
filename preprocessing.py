@@ -8,8 +8,10 @@ import re
 def clean_data(file_name, max_samples, min_length, max_length):
     df = pd.read_csv(file_name)
     df = df.sample(frac=1)
-    max_samples = np.min([max_samples, df.shape[0]-1])
-    df = df.iloc[0:max_samples]
+    if max_samples != None:
+        max_samples = np.min([max_samples, df.shape[0]-1])
+        df = df.iloc[0:max_samples]
+        
     # Removing unnecessary columns
     df = df.drop(columns=['author', 'subreddit', 'score', 'ups', 'downs', 'date', 'created_utc', 'parent_comment'], axis=1)
 
